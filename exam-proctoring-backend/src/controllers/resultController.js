@@ -1,5 +1,6 @@
 import Submission from "../models/Submission.js";
 import Exam from "../models/Exam.js";
+import BehaviorAnalysis from "../models/BehaviorAnalysis.js";
 
 /* =========================
    ORGANIZER: EXAM RESULTS
@@ -32,23 +33,43 @@ export const getExamResults = async (req, res) => {
       .sort({ score: -1, submittedAt: 1 });
 
     /* =========================
+       FETCH BEHAVIOR ANALYSIS
+    ========================= */
+    const analyses = await BehaviorAnalysis.find({ examId });
+    const analysisMap = new Map();
+    analyses.forEach(a => {
+      analysisMap.set(a.candidateId.toString(), {
+        isSuspicious: a.isSuspicious,
+        confidence: a.confidence,
+        riskLevel: a.riskLevel,
+        summary: a.summary,
+      });
+    });
+
+    /* =========================
        BUILD LEADERBOARD
     ========================= */
-    const leaderboard = submissions.map((submission, index) => ({
-      rank: index + 1,
-      candidate: submission.candidateId
-        ? {
-            _id: submission.candidateId._id,
-            name: submission.candidateId.name,
-            email: submission.candidateId.email,
-          }
-        : {
-            name: "Deleted User",
-            email: "N/A",
-          },
-      score: submission.score,
-      submittedAt: submission.submittedAt,
-    }));
+    const leaderboard = submissions.map((submission, index) => {
+      const candidateIdStr = submission.candidateId?._id?.toString();
+      const behavior = analysisMap.get(candidateIdStr) || null;
+
+      return {
+        rank: index + 1,
+        candidate: submission.candidateId
+          ? {
+              _id: submission.candidateId._id,
+              name: submission.candidateId.name,
+              email: submission.candidateId.email,
+            }
+          : {
+              name: "Deleted User",
+              email: "N/A",
+            },
+        score: submission.score,
+        submittedAt: submission.submittedAt,
+        behaviorAnalysis: behavior,
+      };
+    });
 
     /* =========================
        RESPONSE

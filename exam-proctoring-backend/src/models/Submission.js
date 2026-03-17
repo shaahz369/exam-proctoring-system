@@ -24,7 +24,7 @@ const submissionSchema = new mongoose.Schema(
         },
         answer: {
           type: String,
-          required: true,
+          required:false,
         },
       },
     ],

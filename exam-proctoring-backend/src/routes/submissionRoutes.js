@@ -2,7 +2,8 @@ import express from "express";
 import {
   submitExam,
   getMySubmissions,
-  getSubmissionsByExam
+  getMySubmissionDetail,
+  getSubmissionsByExam,
 } from "../controllers/submissionController.js";
 import { authMiddleware as protect } from "../middleware/authMiddleware.js";
 
@@ -12,11 +13,14 @@ const router = express.Router();
    CANDIDATE ROUTES
 ========================= */
 
-// Submit exam (only after startExam)
+// Submit exam
 router.post("/", protect, submitExam);
 
-// Get candidate's own submissions
+// Get all my submissions
 router.get("/my", protect, getMySubmissions);
+
+// Get full detail of a single submission (questions + answers + scoring)
+router.get("/my/:submissionId", protect, getMySubmissionDetail);
 
 /* =========================
    ORGANIZER ROUTES

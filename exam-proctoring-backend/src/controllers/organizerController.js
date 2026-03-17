@@ -3,6 +3,19 @@ import Submission from "../models/Submission.js";
 import ProctorLog from "../models/ProctorLog.js";
 
 /* =========================
+   STRIKE TYPES — must match proctorController.js
+========================= */
+const STRIKE_TYPES = new Set([
+  "EXIT_FULLSCREEN",
+  "TAB_SWITCH",
+  "WINDOW_BLUR",
+  "SCREEN_SHARE_STOPPED",
+  "PHONE_DETECTED",
+  "MULTIPLE_PERSONS",
+  "NO_FACE_DETECTED",
+]);
+
+/* =========================
    ORGANIZER DASHBOARD
 ========================= */
 export const getOrganizerDashboard = async (req, res) => {
@@ -13,40 +26,41 @@ export const getOrganizerDashboard = async (req, res) => {
       createdAt: -1,
     });
 
+    // ✅ Calculate totalSubmissions and totalScore across ALL exams (not just 5)
     let totalSubmissions = 0;
     let totalScore = 0;
+    const uniqueCandidateIds = new Set(); // ✅ Track unique candidates
 
-    const recentExams = await Promise.all(
-      exams.slice(0, 5).map(async (exam) => {
-        const submissions = await Submission.find({
-          examId: exam._id,
-          submittedAt: { $ne: null },
-        });
+    const allSubmissions = await Submission.find({
+      examId: { $in: exams.map(e => e._id) },
+      submittedAt: { $ne: null },
+    });
 
-        submissions.forEach((s) => {
-          totalScore += s.score || 0;
-        });
-
-        totalSubmissions += submissions.length;
-
-        return {
-          _id: exam._id,
-          title: exam.title,
-          examCode: exam.examCode,
-          startTime: exam.startTime,
-          endTime: exam.endTime,
-        };
-      })
-    );
+    allSubmissions.forEach(s => {
+      totalSubmissions++;
+      totalScore += s.score || 0;
+      if (s.candidateId) {
+        uniqueCandidateIds.add(s.candidateId.toString()); // ✅ Unique candidates
+      }
+    });
 
     const averageScore =
       totalSubmissions > 0
         ? (totalScore / totalSubmissions).toFixed(2)
         : 0;
 
+    // ✅ recentExams still shows only last 5 for the table
+    const recentExams = exams.map(exam => ({
+      _id: exam._id,
+      title: exam.title,
+      examCode: exam.examCode,
+      startTime: exam.startTime,
+      endTime: exam.endTime,
+    }));
+
     res.json({
       totalExams: exams.length,
-      totalCandidates: totalSubmissions,
+      totalCandidates: uniqueCandidateIds.size, // ✅ Unique candidates, not submissions
       totalSubmissions,
       averageScore,
       recentExams,
@@ -102,7 +116,7 @@ export const getOrganizerExam = async (req, res) => {
 };
 
 /* =========================
-   🆕 ORGANIZER: PROCTOR LOGS
+   ORGANIZER: PROCTOR LOGS
 ========================= */
 export const getExamProctorLogs = async (req, res) => {
   try {
@@ -128,7 +142,8 @@ export const getExamProctorLogs = async (req, res) => {
         name: log.userId.name,
         email: log.userId.email,
       },
-      strikes: log.events.length,
+      // ✅ Only count events that are real strikes, not all events
+      strikes: log.events.filter(e => STRIKE_TYPES.has(e.type)).length,
       events: log.events,
     }));
 

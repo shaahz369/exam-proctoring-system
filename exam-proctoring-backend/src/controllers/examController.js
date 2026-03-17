@@ -148,13 +148,10 @@ export const getCandidateUpcomingExams = async (req, res) => {
   try {
     const candidateId = req.user._id;
 
-    const exams = await Exam.find({
-      $or: [
-        { assignedCandidates: candidateId },
-        { examCode: { $exists: true } },
-      ],
-      endTime: { $gt: new Date() },
-    }).select("title startTime endTime examCode");
+   const exams = await Exam.find({
+  assignedCandidates: candidateId,
+  endTime: { $gt: new Date() },
+}).select("title startTime endTime examCode");
 
     res.json(exams);
   } catch (error) {

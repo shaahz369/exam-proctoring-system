@@ -19,9 +19,6 @@ export const submitExam = async (req, res) => {
       return res.status(404).json({ message: "Exam not found." });
     }
 
-    /* =========================
-       TIME WINDOW CHECK
-    ========================= */
     if (exam.startTime && now < new Date(exam.startTime)) {
       return res.status(403).json({ message: "Exam has not started yet." });
     }
@@ -29,14 +26,9 @@ export const submitExam = async (req, res) => {
       return res.status(403).json({ message: "Exam has ended." });
     }
 
-    /* =========================
-       VERIFY STARTED EXAM
-    ========================= */
     const submission = await Submission.findOne({ examId, candidateId });
     if (!submission) {
-      return res
-        .status(403)
-        .json({ message: "Exam not started. Please start the exam first." });
+      return res.status(403).json({ message: "Exam not started. Please start the exam first." });
     }
 
     if (submission.submittedAt || submission.isSubmitted) {
@@ -47,8 +39,6 @@ export const submitExam = async (req, res) => {
        AUTO-SCORING (MCQ)
     ========================= */
     let score = 0;
-
-    // Map questionId -> question
     const questionMap = new Map();
     exam.questions.forEach(q => {
       questionMap.set(q._id.toString(), q);
@@ -57,34 +47,23 @@ export const submitExam = async (req, res) => {
     answers.forEach(ans => {
       const question = questionMap.get(ans.questionId);
       if (!question) return;
-
       if (question.type === "mcq") {
-        const correctIndex = question.correctAnswer; // "0" | "1" | ...
+        const correctIndex = question.correctAnswer;
         const correctOption = question.options[Number(correctIndex)];
-
-        if (
-          correctOption !== undefined &&
-          ans.answer.trim() === correctOption.trim()
-        ) {
+        if (correctOption !== undefined && ans.answer.trim() === correctOption.trim()) {
           score += 1;
         }
       }
     });
 
-    /* =========================
-       SAVE SUBMISSION
-    ========================= */
     submission.answers = answers;
     submission.score = score;
     submission.submittedAt = now;
-    submission.isSubmitted = true; // ✅ FIX (CRITICAL)
+    submission.isSubmitted = true;
 
     await submission.save();
 
-    res.status(201).json({
-      message: "Exam submitted successfully.",
-      score,
-    });
+    res.status(201).json({ message: "Exam submitted successfully.", score });
   } catch (error) {
     console.error("Submit exam error:", error);
     res.status(500).json({ message: "Server error during submission." });
@@ -102,6 +81,111 @@ export const getMySubmissions = async (req, res) => {
 
     res.json(submissions);
   } catch (error) {
+    res.status(500).json({ message: "Server error." });
+  }
+};
+
+/* =========================
+   CANDIDATE: SUBMISSION DETAIL
+   GET /api/submissions/my/:submissionId
+   Returns questions + candidate answers + correct answers for review
+========================= */
+export const getMySubmissionDetail = async (req, res) => {
+  try {
+    const { submissionId } = req.params;
+    const candidateId = req.user._id;
+
+    // Find submission and verify it belongs to this candidate
+    const submission = await Submission.findOne({
+      _id: submissionId,
+      candidateId,
+    });
+
+    if (!submission) {
+      return res.status(404).json({ message: "Submission not found." });
+    }
+
+    if (!submission.isSubmitted) {
+      return res.status(403).json({ message: "Exam not yet submitted." });
+    }
+
+    // Fetch exam with all questions INCLUDING correctAnswer (candidate's own review)
+    const exam = await Exam.findById(submission.examId).populate("questions");
+    if (!exam) {
+      return res.status(404).json({ message: "Exam not found." });
+    }
+
+    // Build answer map from submission: questionId → candidate's answer
+    const answerMap = new Map();
+    submission.answers.forEach(a => {
+      answerMap.set(a.questionId.toString(), a.answer || "");
+    });
+
+    // Build detailed question review
+    let correctCount = 0;
+    let wrongCount = 0;
+    let skippedCount = 0;
+
+    const questions = exam.questions.map((q, index) => {
+      const candidateAnswer = answerMap.get(q._id.toString()) || "";
+      const correctIndex = q.correctAnswer;
+      const correctOption = q.type === "mcq" ? q.options[Number(correctIndex)] : null;
+
+      let status = "skipped"; // default
+
+      if (q.type === "mcq") {
+        if (!candidateAnswer) {
+          status = "skipped";
+          skippedCount++;
+        } else if (candidateAnswer.trim() === correctOption?.trim()) {
+          status = "correct";
+          correctCount++;
+        } else {
+          status = "wrong";
+          wrongCount++;
+        }
+      } else {
+        // Text question — just mark as answered or skipped
+        if (candidateAnswer.trim()) {
+          status = "answered";
+        } else {
+          status = "skipped";
+          skippedCount++;
+        }
+      }
+
+      return {
+        index: index + 1,
+        questionId: q._id,
+        questionText: q.questionText,
+        type: q.type,
+        options: q.options || [],
+        correctAnswer: correctOption,       // correct option text for MCQ
+        candidateAnswer,                    // what candidate wrote/selected
+        status,                             // correct | wrong | skipped | answered
+      };
+    });
+
+    res.json({
+      submission: {
+        _id: submission._id,
+        score: submission.score,
+        submittedAt: submission.submittedAt,
+        totalQuestions: exam.questions.length,
+        correctCount,
+        wrongCount,
+        skippedCount,
+      },
+      exam: {
+        _id: exam._id,
+        title: exam.title,
+        duration: exam.duration,
+        startTime: exam.startTime,
+      },
+      questions,
+    });
+  } catch (error) {
+    console.error("Submission detail error:", error);
     res.status(500).json({ message: "Server error." });
   }
 };

@@ -12,8 +12,12 @@ import {
 
 const API_BASE_URL = "http://localhost:5000/api/exams";
 const PROCTOR_API = "http://localhost:5000/api/proctor/log";
-const ML_WS_URL = "ws://localhost:8000/ws/monitor"; // ML Service URL
+const BEHAVIOR_API = "http://localhost:5000/api/proctor/behavior";
+const ML_WS_URL = "ws://localhost:8000/ws/monitor";
+const ML_API_URL = "http://localhost:8000/api";
 const MAX_STRIKES = 3;
+
+const HARD_VIOLATION_DEBOUNCE_MS = 10000; // 10 seconds
 
 const ExamTakerPage = () => {
   const navigate = useNavigate();
@@ -21,17 +25,38 @@ const ExamTakerPage = () => {
 
   const examCode = location.state?.examCode || sessionStorage.getItem("examCode");
 
+  // User ID for behavior analysis session tracking
+  const [userId, setUserId] = useState(null);
+
   const fullscreenRef = useRef(null);
   const videoRef = useRef(null);
-  
+
   // Refs for ML Service
   const wsRef = useRef(null);
-  const canvasRef = useRef(document.createElement("canvas")); 
+  const canvasRef = useRef(document.createElement("canvas"));
   const lastLogTimeRef = useRef(0);
 
   const cameraStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
   const startCalledRef = useRef(false);
+
+  // Debounce ref for WINDOW_BLUR
+  const blurTimeoutRef = useRef(null);
+
+  // Gaze popup timer
+  const gazeAwayStartRef = useRef(null);
+  const gazePopupShownRef = useRef(false);
+
+  // Hard violation debounce refs
+  const lastPhoneLogRef = useRef(0);
+  const lastMultiplePersonsLogRef = useRef(0);
+  const lastNoFaceLogRef = useRef(0);
+
+  // ⭐ PROCTORING GATE
+  const proctoringActiveRef = useRef(false);
+
+  // ⭐ isSubmittedRef — mirrors isSubmitted state for stale closure fix
+  const isSubmittedRef = useRef(false);
 
   const [exam, setExam] = useState(null);
   const [answers, setAnswers] = useState({});
@@ -42,17 +67,23 @@ const ExamTakerPage = () => {
   const [error, setError] = useState(null);
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  
-  // State for ML Alerts
-  const [mlAlert, setMlAlert] = useState(null); 
-  const [mlAlertType, setMlAlertType] = useState("warning"); // NEW: Tracks color (warning vs violation)
+
+  const [mlAlert, setMlAlert] = useState(null);
+  const [mlAlertType, setMlAlertType] = useState("warning");
 
   /* =========================
      ML SERVICE INTEGRATION
   ========================= */
   const startMLMonitoring = () => {
     console.log("🔄 Attempting to connect to ML Service...");
-    wsRef.current = new WebSocket(ML_WS_URL);
+
+    // Build WS URL with session identifiers for LSTM behavior tracking
+    let wsUrl = ML_WS_URL;
+    if (exam?._id && userId) {
+      wsUrl += `?examId=${exam._id}&candidateId=${userId}`;
+    }
+
+    wsRef.current = new WebSocket(wsUrl);
 
     wsRef.current.onopen = () => {
       console.log("✅ WebSocket Connected to ML Service");
@@ -60,48 +91,79 @@ const ExamTakerPage = () => {
 
     wsRef.current.onmessage = (event) => {
       const response = JSON.parse(event.data);
-      
+
       if (response.status === "violation" || response.status === "warning") {
-        
-        // 1. Identify what type of issue we are dealing with
-        const isGazeIssue = response.alerts.some(a => a.includes("SUSPICIOUS_GAZE"));
+
+        const isGazeIssue = response.alerts.some(a => a.includes("SUSPICIOUS_GAZE") || a.includes("GAZE_STRIKE"));
         const isFaceMissing = response.alerts.some(a => a.includes("FACE_NOT_VISIBLE"));
+        const isNoFace = response.alerts.includes("NO_FACE_DETECTED");
         const isHardViolation = response.status === "violation";
 
-        // 2. Set the color state
-        setMlAlertType(response.status); 
+        // ── UI Alert logic ──
+        if (isHardViolation && !isFaceMissing && !isGazeIssue) {
+          const displayText = response.alerts
+            .filter(a => !a.includes("SUSPICIOUS_GAZE") && !a.includes("GAZE_STRIKE"))
+            .join(", ");
+          setMlAlertType("violation");
+          setMlAlert(displayText);
 
-        // 3. Format the display text politely
-        let displayText = "";
-        if (isHardViolation && !isFaceMissing) {
-            // For phones, multiple people, etc.
-            displayText = response.alerts.filter(a => !a.includes("SUSPICIOUS_GAZE")).join(", ");
+        } else if (isNoFace) {
+          setMlAlertType("warning");
+          setMlAlert("No face detected. Please stay in front of the camera.");
+
         } else if (isFaceMissing) {
-            displayText = "Face not visible. Please stay in front of the camera.";
+          setMlAlertType("warning");
+          setMlAlert("Face not visible. Please stay in front of the camera.");
+
         } else if (isGazeIssue) {
-            displayText = "Please focus on the screen.";
+          const now = Date.now();
+          if (gazeAwayStartRef.current === null) {
+            gazeAwayStartRef.current = now;
+            gazePopupShownRef.current = false;
+          }
+          const secondsAway = (now - gazeAwayStartRef.current) / 1000;
+          if (secondsAway >= 5 && !gazePopupShownRef.current) {
+            setMlAlertType("warning");
+            setMlAlert("Please focus on the screen.");
+            gazePopupShownRef.current = true;
+          }
         }
 
-        setMlAlert(displayText);
-        
-        // 4. Log the raw alert to the DB (Debounced)
+        // ── DB Logging ──
         const now = Date.now();
-        if (now - lastLogTimeRef.current > 5000) {
-          handleViolation(response.alerts[0]); 
-          lastLogTimeRef.current = now;
+        const hasPhoneDetected = response.alerts.includes("PHONE_DETECTED");
+        const hasMultiplePersons = response.alerts.includes("MULTIPLE_PERSONS");
+
+        if (hasPhoneDetected) {
+          handleViolation("PHONE_DETECTED");
+
+        } else if (hasMultiplePersons) {
+          if (now - lastMultiplePersonsLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
+            handleViolation("MULTIPLE_PERSONS");
+            lastMultiplePersonsLogRef.current = now;
+          }
+
+        } else if (isNoFace) {
+          if (now - lastNoFaceLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
+            handleViolation("NO_FACE_DETECTED");
+            lastNoFaceLogRef.current = now;
+          }
         }
+
       } else {
-        // Status is "clean"
+        // clean — reset gaze timer and clear popup
+        gazeAwayStartRef.current = null;
+        gazePopupShownRef.current = false;
         setMlAlert(null);
       }
     };
 
     wsRef.current.onerror = (err) => console.error("❌ ML WS Error:", err);
     wsRef.current.onclose = () => console.log("🔌 ML WS Connection Closed");
-    
+
     const intervalId = setInterval(() => {
       sendFrameToML();
-    }, 500);
+    }, 1000);
 
     return () => {
       clearInterval(intervalId);
@@ -141,12 +203,17 @@ const ExamTakerPage = () => {
       videoRef.current.srcObject = stream;
       videoRef.current.muted = true;
       videoRef.current.playsInline = true;
-      await videoRef.current.play();
+      try {
+        await videoRef.current.play();
+      } catch (err) {
+        if (err.name !== "AbortError") throw err;
+      }
     }
   };
 
   const stopCamera = () => {
     cameraStreamRef.current?.getTracks().forEach(t => t.stop());
+    cameraStreamRef.current = null;
   };
 
   /* =========================
@@ -168,12 +235,15 @@ const ExamTakerPage = () => {
     screenStreamRef.current = stream;
 
     track.onended = () => {
-      handleViolation("SCREEN_SHARE_STOPPED");
+      if (proctoringActiveRef.current) {
+        handleViolation("SCREEN_SHARE_STOPPED");
+      }
     };
   };
 
   const stopScreenShare = () => {
     screenStreamRef.current?.getTracks().forEach(t => t.stop());
+    screenStreamRef.current = null;
   };
 
   /* =========================
@@ -181,10 +251,25 @@ const ExamTakerPage = () => {
   ========================= */
   const startProctoredExam = async () => {
     try {
+      // ⭐ Stop any existing streams before restarting
+      // This handles re-entry after EXIT_FULLSCREEN violation
+      stopCamera();
+      stopScreenShare();
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+
       await startCamera();
       await startScreenShare();
       await fullscreenRef.current.requestFullscreen();
       setIsFullscreen(true);
+
+      setTimeout(() => {
+        proctoringActiveRef.current = true;
+        console.log("✅ Proctoring is now active");
+      }, 2000);
+
       startMLMonitoring();
     } catch (err) {
       alert(err.message || "Permission denied");
@@ -198,13 +283,22 @@ const ExamTakerPage = () => {
   ========================= */
   useEffect(() => {
     const onFullscreenChange = () => {
-      if (!document.fullscreenElement && exam && !isSubmitted) {
-        handleViolation("EXIT_FULLSCREEN");
+      if (!document.fullscreenElement) {
+        // ⭐ Always update isFullscreen state when fullscreen exits
+        // so the "Start Exam" overlay reappears and candidate can re-enter
+        setIsFullscreen(false);
+
+        // Only log as violation if proctoring is active and exam not submitted
+        if (exam && !isSubmittedRef.current && proctoringActiveRef.current) {
+          // Pause proctoring gate until they re-enter fullscreen
+          proctoringActiveRef.current = false;
+          handleViolation("EXIT_FULLSCREEN");
+        }
       }
     };
     document.addEventListener("fullscreenchange", onFullscreenChange);
     return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
-  }, [exam, isSubmitted]);
+  }, [exam]); // ← isSubmitted removed from deps, isSubmittedRef handles it
 
   /* =========================
      TAB / WINDOW DETECTION
@@ -212,22 +306,36 @@ const ExamTakerPage = () => {
   useEffect(() => {
     if (!exam || isSubmitted) return;
 
-    const handleVisibility = () => {
+    const handleHidden = () => {
+      if (!proctoringActiveRef.current) return;
       if (document.visibilityState !== "visible") {
         handleViolation("TAB_SWITCH");
       }
     };
 
     const handleBlur = () => {
-      handleViolation("WINDOW_BLUR");
+      if (!proctoringActiveRef.current) return;
+      blurTimeoutRef.current = setTimeout(() => {
+        handleViolation("WINDOW_BLUR");
+      }, 1000);
     };
 
-    document.addEventListener("visibilitychange", handleVisibility);
+    const handleFocus = () => {
+      if (blurTimeoutRef.current) {
+        clearTimeout(blurTimeoutRef.current);
+        blurTimeoutRef.current = null;
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleHidden);
     window.addEventListener("blur", handleBlur);
+    window.addEventListener("focus", handleFocus);
 
     return () => {
-      document.removeEventListener("visibilitychange", handleVisibility);
+      document.removeEventListener("visibilitychange", handleHidden);
       window.removeEventListener("blur", handleBlur);
+      window.removeEventListener("focus", handleFocus);
+      if (blurTimeoutRef.current) clearTimeout(blurTimeoutRef.current);
     };
   }, [exam, isSubmitted]);
 
@@ -255,6 +363,17 @@ const ExamTakerPage = () => {
 
         setExam(data.exam);
         setTimeLeft(data.exam.duration * 60);
+
+        // Fetch user profile to get userId for behavior analysis
+        try {
+          const profileRes = await axios.get(
+            "http://localhost:5000/api/auth/profile",
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          setUserId(profileRes.data._id);
+        } catch (profileErr) {
+          console.error("Failed to fetch user profile:", profileErr);
+        }
 
         const init = {};
         data.exam.questions.forEach(q => (init[q._id] = ""));
@@ -299,7 +418,8 @@ const ExamTakerPage = () => {
      VIOLATIONS
   ========================= */
   const handleViolation = async type => {
-    if (!exam || isSubmitted) return;
+    if (!exam || isSubmittedRef.current) return;
+    if (!proctoringActiveRef.current && type !== "EXIT_FULLSCREEN") return;
 
     try {
       const token = localStorage.getItem("authToken");
@@ -314,13 +434,15 @@ const ExamTakerPage = () => {
         alert("Maximum violations reached. Exam submitted.");
         handleSubmit(true);
       } else {
-        // Prevent intrusive popups for minor warnings or ML detections
-        // The UI overlay handles ML warnings visually.
-        const silentTypes = ["SUSPICIOUS_GAZE", "FACE_NOT_VISIBLE", "PHONE", "MULTIPLE"];
-        const isSilent = silentTypes.some(silentType => type.includes(silentType));
-        
+        const silentTypes = [
+          "SUSPICIOUS_GAZE", "FACE_NOT_VISIBLE",
+          "WINDOW_BLUR", "GAZE_STRIKE", "PHONE", "MULTIPLE",
+          "NO_FACE_DETECTED",
+        ];
+        const isSilent = silentTypes.some(s => type.includes(s));
+
         if (!isSilent) {
-             alert(`⚠️ Violation detected: ${type}`);
+          alert(`⚠️ Violation detected: ${type}`);
         }
       }
     } catch (err) {
@@ -332,7 +454,10 @@ const ExamTakerPage = () => {
      SUBMIT
   ========================= */
   const handleSubmit = async timeout => {
-    if (isSubmitted) return;
+    if (isSubmittedRef.current) return;
+
+    // ⭐ Set ref FIRST — prevents EXIT_FULLSCREEN strike after submission
+    isSubmittedRef.current = true;
     setIsSubmitted(true);
 
     const token = localStorage.getItem("authToken");
@@ -354,6 +479,30 @@ const ExamTakerPage = () => {
     stopScreenShare();
     if (wsRef.current) wsRef.current.close();
     sessionStorage.removeItem("examCode");
+
+    // ── Fetch LSTM behavior report from ML service and store in backend ──
+    try {
+      const behaviorRes = await axios.get(
+        `${ML_API_URL}/behavior-report/${exam._id}/${userId}`
+      );
+
+      if (behaviorRes.data) {
+        await axios.post(
+          BEHAVIOR_API,
+          {
+            examId: exam._id,
+            isSuspicious: behaviorRes.data.is_suspicious,
+            confidence: behaviorRes.data.confidence,
+            riskLevel: behaviorRes.data.risk_level,
+            summary: behaviorRes.data.summary,
+          },
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        console.log("✅ Behavior analysis saved");
+      }
+    } catch (behaviorErr) {
+      console.error("Behavior analysis fetch/save error:", behaviorErr);
+    }
 
     alert("Exam submitted");
     navigate("/dashboard");
@@ -387,43 +536,48 @@ const ExamTakerPage = () => {
 
   return (
     <div ref={fullscreenRef} className="min-h-screen bg-gray-50 relative">
-      
+
       {/* --- ML ALERT OVERLAY --- */}
       {mlAlert && (
         <div className="fixed top-4 left-1/2 transform -translate-x-1/2 z-[60] animate-pulse">
-           <div className={`text-white px-6 py-4 rounded shadow-2xl flex items-center gap-3 border-4 border-white ${
-               mlAlertType === "violation" ? "bg-red-600" : "bg-orange-500"
-             }`}
-           >
-             <ExclamationTriangleIcon className="w-8 h-8" />
-             <div>
-               <h3 className="font-bold text-lg">
-                 {mlAlertType === "violation" ? "PROCTORING ALERT" : "WARNING"}
-               </h3>
-               <p>{mlAlert}</p>
-             </div>
-           </div>
+          <div className={`text-white px-6 py-4 rounded shadow-2xl flex items-center gap-3 border-4 border-white ${
+              mlAlertType === "violation" ? "bg-red-600" : "bg-orange-500"
+            }`}
+          >
+            <ExclamationTriangleIcon className="w-8 h-8" />
+            <div>
+              <h3 className="font-bold text-lg">
+                {mlAlertType === "violation" ? "PROCTORING ALERT" : "WARNING"}
+              </h3>
+              <p>{mlAlert}</p>
+            </div>
+          </div>
         </div>
       )}
 
+      {/* ⭐ Re-entry overlay — shows when not in fullscreen (including after EXIT_FULLSCREEN) */}
       {!isFullscreen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-900 text-white">
+        <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-gray-900 text-white gap-4">
+          <ExclamationTriangleIcon className="w-12 h-12 text-yellow-400" />
+          <p className="text-lg font-semibold text-yellow-300">
+            FULL SCREEN
+          </p>
           <button
             onClick={startProctoredExam}
-            className="px-8 py-4 bg-indigo-600 rounded text-xl font-bold"
+            className="px-8 py-4 bg-indigo-600 rounded text-xl font-bold hover:bg-indigo-700 transition"
           >
-            Start Exam
+            Return to Exam
           </button>
         </div>
       )}
 
-      {/* Webcam preview - Updated Border Logic */}
+      {/* Webcam preview */}
       <video
         ref={videoRef}
         className={`fixed bottom-4 right-4 w-48 h-36 bg-black rounded z-40 object-cover transition-all duration-300 ${
-            mlAlert 
-              ? mlAlertType === "violation" 
-                ? "border-4 border-red-500 shadow-[0_0_20px_rgba(239,68,68,0.8)]" 
+            mlAlert
+              ? mlAlertType === "violation"
+                ? "border-4 border-red-500 shadow-[0_0_20px_rgba(239,68,68,0.8)]"
                 : "border-4 border-orange-500 shadow-[0_0_20px_rgba(249,115,22,0.8)]"
               : "border border-gray-300"
         }`}
@@ -480,9 +634,7 @@ const ExamTakerPage = () => {
             </button>
 
             <button
-              disabled={
-                currentQuestionIndex === exam.questions.length - 1
-              }
+              disabled={currentQuestionIndex === exam.questions.length - 1}
               onClick={() => setCurrentQuestionIndex(i => i + 1)}
               className="px-4 py-2 bg-indigo-600 text-white rounded"
             >

@@ -115,14 +115,17 @@ const OrganizerDashboard = ({
         <StatCard title="Total Exams" value={totalExams} icon={DocumentCheckIcon} color="bg-indigo-600" />
         <StatCard title="Total Submissions" value={totalSubmissions} icon={DocumentCheckIcon} color="bg-green-600" />
         <StatCard title="Total Candidates" value={totalCandidates} icon={UserGroupIcon} color="bg-yellow-600" />
-        <StatCard title="Average Score" value={`${averageScore}%`} icon={UserGroupIcon} color="bg-red-500" />
+        <StatCard title="Average Score" value={`${averageScore * 100}%`} icon={UserGroupIcon} color="bg-red-500" />
       </div>
 
-      {/* Recent Exams */}
+      {/* All Exams — scrollable */}
       <div>
         <div className="flex justify-between items-center mb-5">
           <h2 className="text-2xl font-semibold text-gray-800">
-            Recent Exams
+            All Exams
+            <span className="ml-2 text-sm font-normal text-gray-400">
+              ({recentExams.length} total)
+            </span>
           </h2>
           <button
             onClick={onRefresh}
@@ -133,71 +136,90 @@ const OrganizerDashboard = ({
           </button>
         </div>
 
-        <div className="bg-white p-6 rounded-xl shadow-lg overflow-x-auto">
+        <div className="bg-white rounded-xl shadow-lg overflow-hidden">
           {recentExams.length > 0 ? (
-            <table className="min-w-full divide-y">
-              <thead>
-                <tr className="text-left text-gray-600">
-                  <th className="px-4 py-2">Title</th>
-                  <th className="px-4 py-2">Code</th>
-                  <th className="px-4 py-2">Start</th>
-                  <th className="px-4 py-2">Status</th>
-                  <th className="px-4 py-2">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recentExams.map(exam => (
-                  <tr
-                    key={exam._id}
-                    className="border-t hover:bg-gray-50 transition"
-                  >
-                    <td className="px-4 py-2 font-medium text-blue-600">
-                      {exam.title}
-                    </td>
-                    <td className="px-4 py-2 font-mono">
-                      {exam.examCode}
-                    </td>
-                    <td className="px-4 py-2">
-                      {exam.startTime
-                        ? new Date(exam.startTime).toLocaleString()
-                        : '—'}
-                    </td>
-                    <td className="px-4 py-2">
-                      {exam.endTime && new Date(exam.endTime) < new Date()
-                        ? 'Completed'
-                        : 'Active'}
-                    </td>
-                    <td className="px-4 py-2 space-x-3">
-                      <button
-                        onClick={() => navigate(`/organizer/exams/${exam._id}`)}
-                        className="text-indigo-600 hover:underline text-sm"
-                      >
-                        View Paper
-                      </button>
+            <>
+              {/* ✅ Sticky header + scrollable body */}
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                  <thead className="bg-gray-50 sticky top-0 z-10">
+                    <tr className="text-left text-gray-600">
+                      <th className="px-4 py-3 text-sm font-semibold">#</th>
+                      <th className="px-4 py-3 text-sm font-semibold">Title</th>
+                      <th className="px-4 py-3 text-sm font-semibold">Code</th>
+                      <th className="px-4 py-3 text-sm font-semibold">Start</th>
+                      <th className="px-4 py-3 text-sm font-semibold">Status</th>
+                      <th className="px-4 py-3 text-sm font-semibold">Actions</th>
+                    </tr>
+                  </thead>
+                </table>
+              </div>
 
-                      <button
-                        onClick={() => navigate(`/organizer/exams/${exam._id}/results`)}
-                        className="text-blue-600 hover:underline text-sm font-semibold"
+              {/* ✅ Scrollable tbody — max 6 rows visible, then scroll */}
+              <div className="overflow-y-auto max-h-96 overflow-x-auto">
+                <table className="min-w-full">
+                  <tbody className="divide-y divide-gray-100">
+                    {recentExams.map((exam, index) => (
+                      <tr
+                        key={exam._id}
+                        className="hover:bg-gray-50 transition"
                       >
-                        View Results
-                      </button>
-
-                      <button
-                        onClick={() => {
-                          setSelectedExam(exam);
-                          setShowModal(true);
-                        }}
-                        className="text-green-600 hover:underline text-sm font-semibold"
-                      >
-                        Add Candidates
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                        <td className="px-4 py-3 text-sm text-gray-400">
+                          {index + 1}
+                        </td>
+                        <td className="px-4 py-3 font-medium text-blue-600">
+                          {exam.title}
+                        </td>
+                        <td className="px-4 py-3 font-mono text-sm">
+                          {exam.examCode}
+                        </td>
+                        <td className="px-4 py-3 text-sm">
+                          {exam.startTime
+                            ? new Date(exam.startTime).toLocaleString()
+                            : '—'}
+                        </td>
+                        <td className="px-4 py-3 text-sm">
+                          <span className={`px-2 py-1 rounded-full text-xs font-semibold ${
+                            exam.endTime && new Date(exam.endTime) < new Date()
+                              ? 'bg-gray-100 text-gray-600'
+                              : 'bg-green-100 text-green-700'
+                          }`}>
+                            {exam.endTime && new Date(exam.endTime) < new Date()
+                              ? 'Completed'
+                              : 'Active'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 space-x-3">
+                          <button
+                            onClick={() => navigate(`/organizer/exams/${exam._id}`)}
+                            className="text-indigo-600 hover:underline text-sm"
+                          >
+                            View Paper
+                          </button>
+                          <button
+                            onClick={() => navigate(`/organizer/exams/${exam._id}/results`)}
+                            className="text-blue-600 hover:underline text-sm font-semibold"
+                          >
+                            View Results
+                          </button>
+                          <button
+                            onClick={() => {
+                              setSelectedExam(exam);
+                              setShowModal(true);
+                            }}
+                            className="text-green-600 hover:underline text-sm font-semibold"
+                          >
+                            Add Candidates
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
           ) : (
-            <p className="text-gray-500 text-center">
+            <p className="text-gray-500 text-center p-6">
               No exams created yet.
             </p>
           )}

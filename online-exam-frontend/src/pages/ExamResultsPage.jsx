@@ -143,6 +143,7 @@ const ExamResultsPage = () => {
                   <th className="px-6 py-3 text-left text-xs font-medium">Candidate</th>
                   <th className="px-6 py-3 text-left text-xs font-medium">Email</th>
                   <th className="px-6 py-3 text-left text-xs font-medium">Score</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium">AI Verdict</th>
                   <th className="px-6 py-3 text-left text-xs font-medium">Submitted</th>
                   <th className="px-6 py-3 text-left text-xs font-medium">Proctoring</th>
                 </tr>
@@ -163,6 +164,30 @@ const ExamResultsPage = () => {
                     </td>
                     <td className="px-6 py-4">{row.candidate.email}</td>
                     <td className="px-6 py-4 font-bold">{row.score}</td>
+                    <td className="px-6 py-4">
+                      {row.behaviorAnalysis ? (
+                        <span
+                          className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold ${
+                            row.behaviorAnalysis.riskLevel === "high"
+                              ? "bg-red-100 text-red-800"
+                              : row.behaviorAnalysis.riskLevel === "medium"
+                              ? "bg-yellow-100 text-yellow-800"
+                              : "bg-green-100 text-green-800"
+                          }`}
+                        >
+                          {row.behaviorAnalysis.riskLevel === "high"
+                            ? "🔴"
+                            : row.behaviorAnalysis.riskLevel === "medium"
+                            ? "🟡"
+                            : "🟢"}{" "}
+                          {row.behaviorAnalysis.riskLevel.charAt(0).toUpperCase() +
+                            row.behaviorAnalysis.riskLevel.slice(1)}{" "}
+                          Risk ({(row.behaviorAnalysis.confidence * 100).toFixed(0)}%)
+                        </span>
+                      ) : (
+                        <span className="text-gray-400 text-xs">N/A</span>
+                      )}
+                    </td>
                     <td className="px-6 py-4 text-gray-500">
                       {new Date(row.submittedAt).toLocaleString()}
                     </td>
@@ -245,6 +270,55 @@ const ExamResultsPage = () => {
                 <p className="text-gray-500">No violations recorded.</p>
               )}
             </ul>
+
+            {/* === BEHAVIORAL ANALYSIS SECTION === */}
+            {(() => {
+              const candidateRow = leaderboard.find(
+                (r) => r.candidate._id === selectedCandidate._id
+              );
+              const ba = candidateRow?.behaviorAnalysis;
+              if (!ba) return null;
+              return (
+                <div className="mt-5 pt-4 border-t">
+                  <h3 className="text-lg font-bold mb-2">🧠 AI Behavioral Analysis</h3>
+                  <div className="flex items-center gap-3 mb-2">
+                    <span
+                      className={`inline-flex items-center px-3 py-1 rounded-full text-sm font-bold ${
+                        ba.riskLevel === "high"
+                          ? "bg-red-100 text-red-800"
+                          : ba.riskLevel === "medium"
+                          ? "bg-yellow-100 text-yellow-800"
+                          : "bg-green-100 text-green-800"
+                      }`}
+                    >
+                      {ba.riskLevel === "high"
+                        ? "🔴 High Risk"
+                        : ba.riskLevel === "medium"
+                        ? "🟡 Medium Risk"
+                        : "🟢 Low Risk"}
+                    </span>
+                    <span className="text-gray-600 text-sm">
+                      Confidence: <b>{(ba.confidence * 100).toFixed(1)}%</b>
+                    </span>
+                  </div>
+                  <p className="text-sm text-gray-700 bg-gray-50 p-3 rounded">
+                    {ba.summary}
+                  </p>
+                  <p className="mt-2 text-sm">
+                    Verdict:{" "}
+                    <span
+                      className={`font-bold ${
+                        ba.isSuspicious ? "text-red-600" : "text-green-600"
+                      }`}
+                    >
+                      {ba.isSuspicious
+                        ? "Suspicious — Likely Cheating"
+                        : "Normal — No Cheating Detected"}
+                    </span>
+                  </p>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}

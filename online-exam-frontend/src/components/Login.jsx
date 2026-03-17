@@ -75,8 +75,8 @@ export default function Login({ onAuthSuccess }) {
   };
 
   // Dynamic Content & Classes
-  const CardTitle = isLoginView ? "ExamPro Login" : "ExamPro Signup";
-  const CardSubtitle = isLoginView ? "Welcome back, please enter your details." : "Join ExamPro and start your journey.";
+  const CardTitle = isLoginView ? "Exanor Login" : "Exanor Signup";
+  const CardSubtitle = isLoginView ? "Welcome back, please enter your details." : "Join Exanor and start your journey.";
   const primaryClasses = "bg-blue-600 hover:bg-blue-700 focus:ring-blue-500"; 
   const inputClasses = "w-full bg-gray-100 rounded-lg border border-gray-300 py-3 px-4 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 text-gray-900 transition duration-150 shadow-sm text-base";
   const buttonBase = "w-full py-2.5 rounded-lg text-white text-lg font-semibold shadow-md focus:outline-none focus:ring-2 focus:ring-offset-2 transition duration-150";

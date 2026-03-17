@@ -102,19 +102,6 @@ const Profile = () => {
                 </span>
               </div>
             </div>
-
-            <div className="flex">
-              <div className="w-32 text-sm font-medium text-gray-500">
-                Joined
-              </div>
-              <div className="flex-1 text-gray-900">
-                {new Date(user.createdAt).toLocaleDateString('en-US', { 
-                  year: 'numeric', 
-                  month: 'long', 
-                  day: 'numeric' 
-                })}
-              </div>
-            </div>
           </div>
         </div>
       </div>

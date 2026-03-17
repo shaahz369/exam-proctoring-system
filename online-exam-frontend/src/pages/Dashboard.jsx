@@ -4,7 +4,6 @@ import axios from 'axios';
 
 import CandidateDashboard from '../components/CandidateDashboard';
 import OrganizerDashboard from '../components/OrganizerDashboard';
-import JoinExamForm from '../components/JoinExamForm';
 import CreateExamForm from '../components/CreateExamForm';
 import Profile from './Profile';
 
@@ -15,7 +14,6 @@ import {
   ChartBarIcon,
   ArrowLeftOnRectangleIcon,
   PlusCircleIcon,
-  PlayIcon,
 } from '@heroicons/react/24/outline';
 
 const API_BASE_URL = 'http://localhost:5000/api';
@@ -153,7 +151,6 @@ const Dashboard = () => {
     user.role === 'candidate'
       ? [
           { name: 'Dashboard', icon: ChartBarIcon },
-          { name: 'Join Exam', icon: PlayIcon },
           { name: 'Upcoming Exams', icon: CalendarDaysIcon },
           { name: 'Past Results', icon: DocumentTextIcon },
           { name: 'Profile', icon: UserCircleIcon },
@@ -194,8 +191,6 @@ const Dashboard = () => {
               view="past"
             />
           );
-        case 'Join Exam':
-          return <JoinExamForm />;
         case 'Profile':
           return <Profile />;
         default:
@@ -232,7 +227,7 @@ const Dashboard = () => {
         <div>
           <div className="flex items-center space-x-2 pb-6 border-b">
             <span className="text-2xl font-bold text-blue-600">
-              ExamPro
+              Exanor
             </span>
           </div>
 
@@ -256,7 +251,7 @@ const Dashboard = () => {
 
         <button
           onClick={handleLogout}
-          className="w-full flex items-center space-x-3 p-3 rounded-xl text-gray-600 hover:bg-red-50 hover:text-red-600"
+          className="w-full flex items-center pb-8 space-x-3 p-3 rounded-xl text-gray-600 hover:bg-red-50 hover:text-red-600"
         >
           <ArrowLeftOnRectangleIcon className="w-6 h-6" />
           <span>Log Out</span>
