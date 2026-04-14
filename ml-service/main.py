@@ -1,12 +1,11 @@
 import cv2
 import time
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from core.object_detector import ObjectDetector
 from core.gaze_tracker import GazeTracker
-from core.behavior_analyzer import BehaviorAnalyzer, encode_frame_features
+from core.audio_proctor import AudioProctor
 
 app = FastAPI()
 
@@ -19,35 +18,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize models separately so a failure in one doesn't kill the other
+# Initialize models separately so a failure in one doesn't kill the others
 detector = None
 gaze_tracker = None
-behavior_analyzer = None
+audio_module = None
 
 try:
-    detector = ObjectDetector("models/best.pt")
+    detector = ObjectDetector("models/best.pt") # Update path if needed
     print("✅ Object Detector loaded.")
 except Exception as e:
     print(f"❌ Object Detector failed to load: {e}")
 
 try:
+    # Loads the new strict dynamic-calibration tracker
     gaze_tracker = GazeTracker()
     print("✅ Gaze Tracker loaded.")
 except Exception as e:
     print(f"❌ Gaze Tracker failed to load: {e}")
 
 try:
-    behavior_analyzer = BehaviorAnalyzer()
-    print("✅ Behavior Analyzer loaded.")
+    audio_module = AudioProctor()
+    audio_module.start_listening()
+    print("✅ Audio Proctor loaded and listening.")
 except Exception as e:
-    print(f"❌ Behavior Analyzer failed to load: {e}")
+    print(f"❌ Audio Proctor failed to load: {e}")
+
+
+# Safely release the microphone when you stop the FastAPI server
+@app.on_event("shutdown")
+def shutdown_event():
+    if audio_module:
+        print("Shutting down Audio Module...")
+        audio_module.stop_listening()
+
 
 # How many continuous seconds of looking away before a GAZE_STRIKE is issued
 GAZE_STRIKE_THRESHOLD_SECONDS = 5
-
-# In-memory store for behavior analysis results
-# Key: (examId, candidateId) → prediction dict
-behavior_results = {}
 
 
 @app.websocket("/ws/monitor")
@@ -55,17 +61,12 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print(f"🔌 Client Connected: {websocket.client}")
 
-    # ── Parse session identifiers from query params ──
     exam_id = websocket.query_params.get("examId", "unknown")
-    candidate_id = websocket.query_params.get("candidateId", "unknown")
-    print(f"📋 Session: examId={exam_id}, candidateId={candidate_id}")
+    print(f"📋 Session Started: examId={exam_id}")
 
-    # Per-connection gaze timer state — resets on every new WS connection
+    # Per-connection gaze timer state
     gaze_away_since = None
     gaze_strike_issued = False
-
-    # Per-connection feature buffer for LSTM behavioral analysis
-    feature_buffer = []
 
     try:
         while True:
@@ -79,45 +80,49 @@ async def websocket_endpoint(websocket: WebSocket):
             if frame is None:
                 continue
 
-            # 4. Determine Status
+            # 3. Determine Status
             status = "clean"
             alerts = []
+            analysis = {}
+            obj_analysis = {}
 
             # ── Object Detection ───────────────────────────────────────────────
             if detector is not None:
-                analysis = detector.predict(frame)
+                # Optional: Add brightness boost here if low-light is still an issue
+                obj_analysis = detector.predict(frame)
+                analysis.update(obj_analysis)
 
-                if analysis.get('phone_detected'):
+                if obj_analysis.get('phone_detected'):
                     status = "violation"
                     alerts.append("PHONE_DETECTED")
 
-                if analysis.get('person_count', 0) > 1:
+                if obj_analysis.get('person_count', 0) > 1:
                     status = "violation"
                     alerts.append("MULTIPLE_PERSONS")
 
-                if analysis.get('person_count', 0) == 0:
-                    if status == "clean":
-                        status = "warning"
-                    alerts.append("NO_FACE_DETECTED")
-            else:
-                analysis = {}
+                #if obj_analysis.get('person_count', 0) == 0:
+                 #   if status == "clean":
+                  #      status = "warning"
+                   # alerts.append("NO_FACE_DETECTED")
 
             # ── Gaze Tracking ──────────────────────────────────────────────────
             if gaze_tracker is not None:
                 gaze_direction, pitch, yaw = gaze_tracker.predict(frame)
 
-                # Attach gaze data to analysis payload
                 analysis['gaze_direction'] = gaze_direction
                 analysis['pitch'] = round(pitch, 2)
                 analysis['yaw'] = round(yaw, 2)
 
-                if gaze_direction in ["LOOKING_LEFT", "LOOKING_RIGHT", "LOOKING_DOWN", "LOOKING_UP"]:
-                    # Immediate warning every frame (original behavior)
+                # ⭐ NEW: Handle the silent 2-second calibration phase
+                if gaze_direction == "CALIBRATING":
+                    alerts.append("GAZE_CALIBRATING")
+                
+                # Handle strict wandering eyes
+                elif gaze_direction in ["LOOKING_LEFT", "LOOKING_RIGHT", "LOOKING_DOWN", "LOOKING_UP"]:
                     if status == "clean":
                         status = "warning"
                     alerts.append(f"SUSPICIOUS_GAZE: {gaze_direction}")
 
-                    # 5-second strike timer (additive)
                     now = time.time()
                     if gaze_away_since is None:
                         gaze_away_since = now
@@ -131,22 +136,30 @@ async def websocket_endpoint(websocket: WebSocket):
                         gaze_strike_issued = True
 
                 else:
-                    # Reset timer when user looks back
+                    # Reset timer when user looks back (FOCUSED)
                     if gaze_direction == "FOCUSED":
                         gaze_away_since = None
                         gaze_strike_issued = False
 
-                # FACE_NOT_VISIBLE — kept outside if/else (same as original)
-                if gaze_direction == "NO_FACE" and analysis.get('person_count', 0) > 0:
+                # Handle Face Not Visible specifically for Gaze Module
+                if gaze_direction == "NO_FACE" and obj_analysis.get('person_count', 0) > 0:
                     if status == "clean":
                         status = "warning"
                     alerts.append("FACE_NOT_VISIBLE")
 
-            # ── Accumulate features for LSTM ───────────────────────────────────
-            features = encode_frame_features(analysis)
-            feature_buffer.append(features)
+            # ── Audio Monitoring ───────────────────────────────────────────────
+            if audio_module is not None:
+                current_audio_label = audio_module.audio_label
+                analysis['audio_status'] = current_audio_label
 
-            # 5. Send Response
+                if "Speech Detected" in current_audio_label:
+                    status = "violation"
+                    alerts.append("SPEECH_DETECTED")
+            else:
+                analysis['audio_status'] = "Offline"
+
+
+            # 4. Send Response to Frontend
             await websocket.send_json({
                 "status": status,
                 "alerts": alerts,
@@ -155,37 +168,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print("🔌 Client Disconnected")
+        # Reset the gaze tracker's calibration state so the next user gets a fresh calibration!
+        if gaze_tracker:
+            gaze_tracker.is_calibrated = False
+            gaze_tracker.calibration_data = {'LEFT': [], 'RIGHT': [], 'UP': [], 'DOWN': []}
+
     except Exception as e:
         print(f"⚠️ Error processing frame: {e}")
         try:
             await websocket.close()
         except:
             pass
-
-    # ── Run LSTM analysis on disconnect ────────────────────────────────────
-    if behavior_analyzer is not None and len(feature_buffer) > 0:
-        try:
-            prediction = behavior_analyzer.predict(feature_buffer)
-            behavior_results[(exam_id, candidate_id)] = prediction
-            print(f"🧠 Behavior analysis for ({exam_id}, {candidate_id}): "
-                  f"risk={prediction['risk_level']}, confidence={prediction['confidence']}")
-        except Exception as e:
-            print(f"⚠️ Behavior analysis failed: {e}")
-    else:
-        print(f"⚠️ Skipped behavior analysis: analyzer={'loaded' if behavior_analyzer else 'missing'}, frames={len(feature_buffer)}")
-
-
-# ── REST endpoint for behavior report ──────────────────────────────────────────
-@app.get("/api/behavior-report/{exam_id}/{candidate_id}")
-async def get_behavior_report(exam_id: str, candidate_id: str):
-    """
-    Returns the LSTM behavior analysis result for a specific candidate in an exam.
-    Called by the frontend after exam submission.
-    """
-    key = (exam_id, candidate_id)
-    result = behavior_results.get(key)
-
-    if result is None:
-        raise HTTPException(status_code=404, detail="No behavior report found for this session.")
-
-    return JSONResponse(content=result)

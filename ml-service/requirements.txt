@@ -1,10 +1,12 @@
 fastapi
 uvicorn[standard]
-ultralytics
-opencv-python-headless
-numpy
 websockets
+ultralytics
 opencv-python
+numpy
 mediapipe
 protobuf==3.20.3
 torch
+librosa
+sounddevice
+onnxruntime

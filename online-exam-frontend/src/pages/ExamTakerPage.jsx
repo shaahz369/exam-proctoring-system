@@ -8,16 +8,17 @@ import {
   ChevronRightIcon,
   CheckIcon,
   ExclamationTriangleIcon,
+  InformationCircleIcon
 } from "@heroicons/react/24/outline";
 
 const API_BASE_URL = "http://localhost:5000/api/exams";
 const PROCTOR_API = "http://localhost:5000/api/proctor/log";
-const BEHAVIOR_API = "http://localhost:5000/api/proctor/behavior";
 const ML_WS_URL = "ws://localhost:8000/ws/monitor";
-const ML_API_URL = "http://localhost:8000/api";
 const MAX_STRIKES = 3;
 
+// Debounce limits to prevent logging 100 times per second
 const HARD_VIOLATION_DEBOUNCE_MS = 10000; // 10 seconds
+const GAZE_STRIKE_DEBOUNCE_MS = 5000; // 5 seconds for repeated gaze strikes
 
 const ExamTakerPage = () => {
   const navigate = useNavigate();
@@ -25,16 +26,12 @@ const ExamTakerPage = () => {
 
   const examCode = location.state?.examCode || sessionStorage.getItem("examCode");
 
-  // User ID for behavior analysis session tracking
-  const [userId, setUserId] = useState(null);
-
   const fullscreenRef = useRef(null);
   const videoRef = useRef(null);
 
   // Refs for ML Service
   const wsRef = useRef(null);
   const canvasRef = useRef(document.createElement("canvas"));
-  const lastLogTimeRef = useRef(0);
 
   const cameraStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
@@ -43,19 +40,15 @@ const ExamTakerPage = () => {
   // Debounce ref for WINDOW_BLUR
   const blurTimeoutRef = useRef(null);
 
-  // Gaze popup timer
-  const gazeAwayStartRef = useRef(null);
-  const gazePopupShownRef = useRef(false);
-
-  // Hard violation debounce refs
+  // DB Logging Debounce refs
   const lastPhoneLogRef = useRef(0);
   const lastMultiplePersonsLogRef = useRef(0);
   const lastNoFaceLogRef = useRef(0);
+  const lastSpeechLogRef = useRef(0);
+  const lastGazeStrikeLogRef = useRef(0);
 
   // ⭐ PROCTORING GATE
   const proctoringActiveRef = useRef(false);
-
-  // ⭐ isSubmittedRef — mirrors isSubmitted state for stale closure fix
   const isSubmittedRef = useRef(false);
 
   const [exam, setExam] = useState(null);
@@ -68,8 +61,9 @@ const ExamTakerPage = () => {
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
+  // Clean UI Overlay States
   const [mlAlert, setMlAlert] = useState(null);
-  const [mlAlertType, setMlAlertType] = useState("warning");
+  const [mlAlertType, setMlAlertType] = useState("warning"); // "warning" | "violation" | "info"
 
   /* =========================
      ML SERVICE INTEGRATION
@@ -77,12 +71,7 @@ const ExamTakerPage = () => {
   const startMLMonitoring = () => {
     console.log("🔄 Attempting to connect to ML Service...");
 
-    // Build WS URL with session identifiers for LSTM behavior tracking
-    let wsUrl = ML_WS_URL;
-    if (exam?._id && userId) {
-      wsUrl += `?examId=${exam._id}&candidateId=${userId}`;
-    }
-
+    const wsUrl = exam?._id ? `${ML_WS_URL}?examId=${exam._id}` : ML_WS_URL;
     wsRef.current = new WebSocket(wsUrl);
 
     wsRef.current.onopen = () => {
@@ -93,67 +82,81 @@ const ExamTakerPage = () => {
       const response = JSON.parse(event.data);
 
       if (response.status === "violation" || response.status === "warning") {
+        const alerts = response.alerts || [];
 
-        const isGazeIssue = response.alerts.some(a => a.includes("SUSPICIOUS_GAZE") || a.includes("GAZE_STRIKE"));
-        const isFaceMissing = response.alerts.some(a => a.includes("FACE_NOT_VISIBLE"));
-        const isNoFace = response.alerts.includes("NO_FACE_DETECTED");
-        const isHardViolation = response.status === "violation";
-
-        // ── UI Alert logic ──
-        if (isHardViolation && !isFaceMissing && !isGazeIssue) {
-          const displayText = response.alerts
-            .filter(a => !a.includes("SUSPICIOUS_GAZE") && !a.includes("GAZE_STRIKE"))
-            .join(", ");
-          setMlAlertType("violation");
-          setMlAlert(displayText);
-
-        } else if (isNoFace) {
-          setMlAlertType("warning");
-          setMlAlert("No face detected. Please stay in front of the camera.");
-
-        } else if (isFaceMissing) {
-          setMlAlertType("warning");
-          setMlAlert("Face not visible. Please stay in front of the camera.");
-
-        } else if (isGazeIssue) {
-          const now = Date.now();
-          if (gazeAwayStartRef.current === null) {
-            gazeAwayStartRef.current = now;
-            gazePopupShownRef.current = false;
-          }
-          const secondsAway = (now - gazeAwayStartRef.current) / 1000;
-          if (secondsAway >= 5 && !gazePopupShownRef.current) {
-            setMlAlertType("warning");
-            setMlAlert("Please focus on the screen.");
-            gazePopupShownRef.current = true;
-          }
+        // --- 1. HANDLE CALIBRATION PHASE ---
+        if (alerts.includes("GAZE_CALIBRATING")) {
+          setMlAlertType("info");
+          setMlAlert("CALIBRATING GAZE... Please look directly at the center of your screen.");
+          return; // Skip checking other violations during setup
         }
 
-        // ── DB Logging ──
+        // --- 2. EXTRACT ALERTS ---
+        const isFaceMissing = alerts.some(a => a.includes("FACE_NOT_VISIBLE"));
+        const isNoFace = alerts.includes("NO_FACE_DETECTED");
+        const hasPhoneDetected = alerts.includes("PHONE_DETECTED");
+        const hasMultiplePersons = alerts.includes("MULTIPLE_PERSONS");
+        const hasSpeech = alerts.includes("SPEECH_DETECTED");
+        const hasGazeStrike = alerts.includes("GAZE_STRIKE");
+        
+        // Find specific directional gaze warning
+        const specificGazeAlert = alerts.find(a => a.startsWith("SUSPICIOUS_GAZE"));
+
+        // --- 3. UI ALERT LOGIC ---
+        let displayAlerts = [];
+        if (hasPhoneDetected) displayAlerts.push("Cell phone detected!");
+        if (hasMultiplePersons) displayAlerts.push("Multiple people detected!");
+        if (hasSpeech) displayAlerts.push("Talking/Speech detected!");
+        if (hasGazeStrike) displayAlerts.push("Continuous Gaze Violation!");
+
+        if (displayAlerts.length > 0) {
+          setMlAlertType("violation");
+          setMlAlert(displayAlerts.join(" | "));
+        } else if (isNoFace || isFaceMissing) {
+          setMlAlertType("warning");
+          setMlAlert("Face not visible. Please stay in front of the camera.");
+        } else if (specificGazeAlert) {
+          // Immediate directional warning for Strict Mode
+          let directionText = "Looking away!";
+          if (specificGazeAlert.includes("LEFT")) directionText = "Looking Left! Please focus on your screen.";
+          if (specificGazeAlert.includes("RIGHT")) directionText = "Looking Right! Please focus on your screen.";
+          if (specificGazeAlert.includes("UP")) directionText = "Looking Up! Please focus on your screen.";
+          if (specificGazeAlert.includes("DOWN")) directionText = "Looking Down! Please focus on your screen.";
+          
+          setMlAlertType("warning");
+          setMlAlert(directionText);
+        }
+
+        // --- 4. DB LOGGING LOGIC ---
         const now = Date.now();
-        const hasPhoneDetected = response.alerts.includes("PHONE_DETECTED");
-        const hasMultiplePersons = response.alerts.includes("MULTIPLE_PERSONS");
-
-        if (hasPhoneDetected) {
+        
+        if (hasPhoneDetected && now - lastPhoneLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
           handleViolation("PHONE_DETECTED");
+          lastPhoneLogRef.current = now;
+        }
 
-        } else if (hasMultiplePersons) {
-          if (now - lastMultiplePersonsLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
-            handleViolation("MULTIPLE_PERSONS");
-            lastMultiplePersonsLogRef.current = now;
-          }
+        if (hasMultiplePersons && now - lastMultiplePersonsLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
+          handleViolation("MULTIPLE_PERSONS");
+          lastMultiplePersonsLogRef.current = now;
+        }
 
-        } else if (isNoFace) {
-          if (now - lastNoFaceLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
-            handleViolation("NO_FACE_DETECTED");
-            lastNoFaceLogRef.current = now;
-          }
+        if (hasSpeech && now - lastSpeechLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
+          handleViolation("SPEECH_DETECTED");
+          lastSpeechLogRef.current = now;
+        }
+
+        if (isNoFace && now - lastNoFaceLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
+          handleViolation("NO_FACE_DETECTED");
+          lastNoFaceLogRef.current = now;
+        }
+
+        if (hasGazeStrike && now - lastGazeStrikeLogRef.current > GAZE_STRIKE_DEBOUNCE_MS) {
+          handleViolation("GAZE_STRIKE");
+          lastGazeStrikeLogRef.current = now;
         }
 
       } else {
-        // clean — reset gaze timer and clear popup
-        gazeAwayStartRef.current = null;
-        gazePopupShownRef.current = false;
+        // Status is Clean — clear UI popup
         setMlAlert(null);
       }
     };
@@ -217,7 +220,7 @@ const ExamTakerPage = () => {
   };
 
   /* =========================
-     SCREEN SHARE (ENTIRE SCREEN)
+     SCREEN SHARE
   ========================= */
   const startScreenShare = async () => {
     const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -251,8 +254,6 @@ const ExamTakerPage = () => {
   ========================= */
   const startProctoredExam = async () => {
     try {
-      // ⭐ Stop any existing streams before restarting
-      // This handles re-entry after EXIT_FULLSCREEN violation
       stopCamera();
       stopScreenShare();
       if (wsRef.current) {
@@ -284,13 +285,8 @@ const ExamTakerPage = () => {
   useEffect(() => {
     const onFullscreenChange = () => {
       if (!document.fullscreenElement) {
-        // ⭐ Always update isFullscreen state when fullscreen exits
-        // so the "Start Exam" overlay reappears and candidate can re-enter
         setIsFullscreen(false);
-
-        // Only log as violation if proctoring is active and exam not submitted
         if (exam && !isSubmittedRef.current && proctoringActiveRef.current) {
-          // Pause proctoring gate until they re-enter fullscreen
           proctoringActiveRef.current = false;
           handleViolation("EXIT_FULLSCREEN");
         }
@@ -298,7 +294,7 @@ const ExamTakerPage = () => {
     };
     document.addEventListener("fullscreenchange", onFullscreenChange);
     return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
-  }, [exam]); // ← isSubmitted removed from deps, isSubmittedRef handles it
+  }, [exam]);
 
   /* =========================
      TAB / WINDOW DETECTION
@@ -364,17 +360,6 @@ const ExamTakerPage = () => {
         setExam(data.exam);
         setTimeLeft(data.exam.duration * 60);
 
-        // Fetch user profile to get userId for behavior analysis
-        try {
-          const profileRes = await axios.get(
-            "http://localhost:5000/api/auth/profile",
-            { headers: { Authorization: `Bearer ${token}` } }
-          );
-          setUserId(profileRes.data._id);
-        } catch (profileErr) {
-          console.error("Failed to fetch user profile:", profileErr);
-        }
-
         const init = {};
         data.exam.questions.forEach(q => (init[q._id] = ""));
         setAnswers(init);
@@ -435,14 +420,15 @@ const ExamTakerPage = () => {
         handleSubmit(true);
       } else {
         const silentTypes = [
-          "SUSPICIOUS_GAZE", "FACE_NOT_VISIBLE",
-          "WINDOW_BLUR", "GAZE_STRIKE", "PHONE", "MULTIPLE",
-          "NO_FACE_DETECTED",
+          "SUSPICIOUS_GAZE", "FACE_NOT_VISIBLE", "WINDOW_BLUR", 
+          "GAZE_STRIKE", "PHONE_DETECTED", "MULTIPLE_PERSONS", 
+          "NO_FACE_DETECTED", "SPEECH_DETECTED"
         ];
+        
         const isSilent = silentTypes.some(s => type.includes(s));
 
         if (!isSilent) {
-          alert(`⚠️ Violation detected: ${type}`);
+          alert(`⚠️ System Violation: ${type}`);
         }
       }
     } catch (err) {
@@ -456,7 +442,6 @@ const ExamTakerPage = () => {
   const handleSubmit = async timeout => {
     if (isSubmittedRef.current) return;
 
-    // ⭐ Set ref FIRST — prevents EXIT_FULLSCREEN strike after submission
     isSubmittedRef.current = true;
     setIsSubmitted(true);
 
@@ -480,36 +465,12 @@ const ExamTakerPage = () => {
     if (wsRef.current) wsRef.current.close();
     sessionStorage.removeItem("examCode");
 
-    // ── Fetch LSTM behavior report from ML service and store in backend ──
-    try {
-      const behaviorRes = await axios.get(
-        `${ML_API_URL}/behavior-report/${exam._id}/${userId}`
-      );
-
-      if (behaviorRes.data) {
-        await axios.post(
-          BEHAVIOR_API,
-          {
-            examId: exam._id,
-            isSuspicious: behaviorRes.data.is_suspicious,
-            confidence: behaviorRes.data.confidence,
-            riskLevel: behaviorRes.data.risk_level,
-            summary: behaviorRes.data.summary,
-          },
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
-        console.log("✅ Behavior analysis saved");
-      }
-    } catch (behaviorErr) {
-      console.error("Behavior analysis fetch/save error:", behaviorErr);
-    }
-
-    alert("Exam submitted");
+    alert("Exam submitted successfully.");
     navigate("/dashboard");
   };
 
   /* =========================
-     UI
+     UI RENDER
   ========================= */
   const formatTime = useMemo(() => {
     const m = Math.floor(timeLeft / 60);
@@ -534,33 +495,37 @@ const ExamTakerPage = () => {
 
   const q = exam.questions[currentQuestionIndex];
 
+  // Dynamic styling based on alert type
+  const alertConfig = {
+    info: { bg: "bg-blue-500", border: "border-blue-500", shadow: "shadow-[0_0_20px_rgba(59,130,246,0.8)]", title: "SYSTEM SETUP", icon: <InformationCircleIcon className="w-8 h-8" /> },
+    warning: { bg: "bg-orange-500", border: "border-orange-500", shadow: "shadow-[0_0_20px_rgba(249,115,22,0.8)]", title: "WARNING", icon: <ExclamationTriangleIcon className="w-8 h-8" /> },
+    violation: { bg: "bg-red-600", border: "border-red-500", shadow: "shadow-[0_0_20px_rgba(239,68,68,0.8)]", title: "PROCTORING ALERT", icon: <ExclamationTriangleIcon className="w-8 h-8" /> }
+  };
+
+  const currentConfig = alertConfig[mlAlertType] || alertConfig.warning;
+
   return (
     <div ref={fullscreenRef} className="min-h-screen bg-gray-50 relative">
 
       {/* --- ML ALERT OVERLAY --- */}
       {mlAlert && (
         <div className="fixed top-4 left-1/2 transform -translate-x-1/2 z-[60] animate-pulse">
-          <div className={`text-white px-6 py-4 rounded shadow-2xl flex items-center gap-3 border-4 border-white ${
-              mlAlertType === "violation" ? "bg-red-600" : "bg-orange-500"
-            }`}
-          >
-            <ExclamationTriangleIcon className="w-8 h-8" />
+          <div className={`text-white px-6 py-4 rounded shadow-2xl flex items-center gap-3 border-4 border-white ${currentConfig.bg}`}>
+            {currentConfig.icon}
             <div>
-              <h3 className="font-bold text-lg">
-                {mlAlertType === "violation" ? "PROCTORING ALERT" : "WARNING"}
-              </h3>
+              <h3 className="font-bold text-lg">{currentConfig.title}</h3>
               <p>{mlAlert}</p>
             </div>
           </div>
         </div>
       )}
 
-      {/* ⭐ Re-entry overlay — shows when not in fullscreen (including after EXIT_FULLSCREEN) */}
+      {/* Re-entry overlay */}
       {!isFullscreen && (
         <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-gray-900 text-white gap-4">
           <ExclamationTriangleIcon className="w-12 h-12 text-yellow-400" />
           <p className="text-lg font-semibold text-yellow-300">
-            FULL SCREEN
+            FULL SCREEN REQUIRED
           </p>
           <button
             onClick={startProctoredExam}
@@ -571,14 +536,12 @@ const ExamTakerPage = () => {
         </div>
       )}
 
-      {/* Webcam preview */}
+      {/* Webcam preview with dynamic glowing borders */}
       <video
         ref={videoRef}
         className={`fixed bottom-4 right-4 w-48 h-36 bg-black rounded z-40 object-cover transition-all duration-300 ${
             mlAlert
-              ? mlAlertType === "violation"
-                ? "border-4 border-red-500 shadow-[0_0_20px_rgba(239,68,68,0.8)]"
-                : "border-4 border-orange-500 shadow-[0_0_20px_rgba(249,115,22,0.8)]"
+              ? `border-4 ${currentConfig.border} ${currentConfig.shadow}`
               : "border border-gray-300"
         }`}
       />
@@ -628,7 +591,7 @@ const ExamTakerPage = () => {
             <button
               disabled={currentQuestionIndex === 0}
               onClick={() => setCurrentQuestionIndex(i => i - 1)}
-              className="px-4 py-2 bg-gray-200 rounded"
+              className="px-4 py-2 bg-gray-200 rounded hover:bg-gray-300 transition"
             >
               <ChevronLeftIcon className="w-5 h-5 inline" /> Prev
             </button>
@@ -636,7 +599,7 @@ const ExamTakerPage = () => {
             <button
               disabled={currentQuestionIndex === exam.questions.length - 1}
               onClick={() => setCurrentQuestionIndex(i => i + 1)}
-              className="px-4 py-2 bg-indigo-600 text-white rounded"
+              className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 transition"
             >
               Next <ChevronRightIcon className="w-5 h-5 inline" />
             </button>
@@ -644,7 +607,7 @@ const ExamTakerPage = () => {
 
           <button
             onClick={() => handleSubmit(false)}
-            className="mt-6 w-full bg-red-600 text-white py-3 rounded font-bold"
+            className="mt-6 w-full bg-red-600 hover:bg-red-700 transition text-white py-3 rounded font-bold"
           >
             <CheckIcon className="w-5 h-5 inline mr-2" />
             Submit Exam
