@@ -111,11 +111,10 @@ const OrganizerDashboard = ({
       </div>
 
       {/* Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         <StatCard title="Total Exams" value={totalExams} icon={DocumentCheckIcon} color="bg-indigo-600" />
         <StatCard title="Total Submissions" value={totalSubmissions} icon={DocumentCheckIcon} color="bg-green-600" />
         <StatCard title="Total Candidates" value={totalCandidates} icon={UserGroupIcon} color="bg-yellow-600" />
-        <StatCard title="Average Score" value={`${averageScore * 100}%`} icon={UserGroupIcon} color="bg-red-500" />
       </div>
 
       {/* All Exams — scrollable */}

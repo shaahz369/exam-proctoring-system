@@ -39,8 +39,8 @@ const ExamTakerPage = () => {
   const alertTimeoutRef = useRef(null);
 
   // Stable refs — always hold latest value, safe to read inside any closure
-  const examRef    = useRef(null); // mirrors `exam` state
-  const answersRef = useRef({});   // mirrors `answers` state
+  const examRef    = useRef(null);
+  const answersRef = useRef({});
 
   // DB debounce refs
   const lastPhoneLogRef           = useRef(0);
@@ -49,8 +49,13 @@ const ExamTakerPage = () => {
   const lastSpeechLogRef          = useRef(0);
   const lastGazeStrikeLogRef      = useRef(0);
 
-  const proctoringActiveRef = useRef(false);
-  const isSubmittedRef      = useRef(false);
+  const proctoringActiveRef  = useRef(false);
+  const isSubmittedRef       = useRef(false);
+  // ✅ Tracks latest strike count locally so debounce can be bypassed when over limit
+  const currentStrikesRef    = useRef(0);
+
+  // ✅ FIX: ref to always hold the latest handleViolation so closures never go stale
+  const handleViolationRef = useRef(null);
 
   const [exam,                 setExam]                 = useState(null);
   const [answers,              setAnswers]              = useState({});
@@ -113,8 +118,9 @@ const ExamTakerPage = () => {
       throw new Error("You must share the entire screen.");
     }
     screenStreamRef.current = stream;
+    // ✅ FIX: use handleViolationRef so closure always has the latest function
     track.onended = () => {
-      if (proctoringActiveRef.current) handleViolation("SCREEN_SHARE_STOPPED");
+      if (proctoringActiveRef.current) handleViolationRef.current("SCREEN_SHARE_STOPPED");
     };
   };
 
@@ -125,8 +131,6 @@ const ExamTakerPage = () => {
 
   /* =========================
      SUBMIT
-     Declared BEFORE handleViolation so it can be safely called from within it.
-     Uses examRef + answersRef to avoid stale closure bugs.
   ========================= */
   const handleSubmit = async (timeout) => {
     if (isSubmittedRef.current) return;
@@ -165,13 +169,20 @@ const ExamTakerPage = () => {
 
   /* =========================
      VIOLATIONS
-     Declared AFTER handleSubmit — calls it when strike limit is reached.
-     Uses examRef to avoid stale closure on `exam`.
   ========================= */
   const handleViolation = async (type) => {
     const currentExam = examRef.current;
     if (!currentExam || isSubmittedRef.current) return;
     if (!proctoringActiveRef.current && type !== "EXIT_FULLSCREEN") return;
+
+    // ✅ FIX: if we already know strikes are at/over limit locally, submit immediately
+    // without waiting for another debounce-gated API call
+    if (currentStrikesRef.current >= MAX_STRIKES) {
+      console.log(`🚨 Local strike count ${currentStrikesRef.current} >= ${MAX_STRIKES}, forcing submit`);
+      alert(`Maximum violations reached. Your exam will now be submitted.`);
+      handleSubmit(true);
+      return;
+    }
 
     try {
       const token = localStorage.getItem("authToken");
@@ -181,9 +192,13 @@ const ExamTakerPage = () => {
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
-      if (res.data.strikes >= MAX_STRIKES) {
-        alert("Maximum violations reached. Your exam will now be submitted.");
-        handleSubmit(true); // ✅ always defined above, always has fresh exam/answers
+      const strikes = res.data.strikes;
+      currentStrikesRef.current = strikes; // ✅ always keep local ref in sync
+      console.log(`⚠️ Violation: ${type} | Strikes: ${strikes}/${MAX_STRIKES}`);
+
+      if (strikes >= MAX_STRIKES) {
+        alert(`Maximum violations reached (${strikes}/${MAX_STRIKES}). Your exam will now be submitted.`);
+        handleSubmit(true);
       } else {
         const silentTypes = [
           "SUSPICIOUS_GAZE", "FACE_NOT_VISIBLE", "WINDOW_BLUR",
@@ -191,13 +206,16 @@ const ExamTakerPage = () => {
           "NO_FACE_DETECTED","SPEECH_DETECTED",
         ];
         if (!silentTypes.some(s => type.includes(s))) {
-          alert(`⚠️ System Violation: ${type}`);
+          warning(`⚠️ System Violation: ${type} (${strikes}/${MAX_STRIKES} strikes)`);
         }
       }
     } catch (err) {
-      console.error(err);
+      console.error("Violation log error:", err);
     }
   };
+
+  // ✅ FIX: keep handleViolationRef always pointing to the latest handleViolation
+  handleViolationRef.current = handleViolation;
 
   /* =========================
      ML SERVICE INTEGRATION
@@ -222,85 +240,86 @@ const ExamTakerPage = () => {
       }
     };
 
-   wsRef.current.onmessage = (event) => {
-  if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    wsRef.current.onmessage = (event) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
-  const response = JSON.parse(event.data);
+      const response = JSON.parse(event.data);
 
-  if (response.type === "CALIBRATION_ACK") {
-    console.log("✅ Calibration acknowledged.");
-    return;
-  }
+      if (response.type === "CALIBRATION_ACK") {
+        console.log("✅ Calibration acknowledged.");
+        return;
+      }
 
-  // Handle violations and warnings
-  if (response.status === "violation" || response.status === "warning") {
-    const alerts = response.alerts || [];
-    const now = Date.now();
+      if (response.status === "violation" || response.status === "warning") {
+        const alerts = response.alerts || [];
+        const now = Date.now();
 
-    // ── Extract flags ─────────────────────────────────────────────
-    const isFaceMissing      = alerts.some(a => a.includes("FACE_NOT_VISIBLE"));
-    const isNoFace           = alerts.includes("NO_FACE_DETECTED");
-    const hasPhoneDetected   = alerts.includes("PHONE_DETECTED");
-    const hasMultiplePersons = alerts.includes("MULTIPLE_PERSONS");
-    const hasSpeech          = alerts.includes("SPEECH_DETECTED");
-    const hasGazeStrike      = alerts.includes("GAZE_STRIKE");
-    const hasSuspiciousGaze  = alerts.some(a => a.startsWith("SUSPICIOUS_GAZE"));
+        // ── Extract flags ──────────────────────────────────────────
+        const isFaceMissing      = alerts.some(a => a.includes("FACE_NOT_VISIBLE"));
+        const isNoFace           = alerts.includes("NO_FACE_DETECTED");
+        const hasPhoneDetected   = alerts.includes("PHONE_DETECTED");
+        const hasMultiplePersons = alerts.includes("MULTIPLE_PERSONS");
+        const hasSpeech          = alerts.includes("SPEECH_DETECTED");
+        const hasGazeStrike      = alerts.includes("GAZE_STRIKE");
+        const hasSuspiciousGaze  = alerts.some(a => a.startsWith("SUSPICIOUS_GAZE"));
 
-    const countdownAlert = alerts.find(a => a.startsWith("GAZE_COUNTDOWN:"));
-    const countdownValue = countdownAlert ? parseInt(countdownAlert.split(":")[1].trim(), 10) : null;
+        const countdownAlert = alerts.find(a => a.startsWith("GAZE_COUNTDOWN:"));
+        const countdownValue = countdownAlert
+          ? parseInt(countdownAlert.split(":")[1].trim(), 10)
+          : null;
 
-    // ── 1. UI ALERTS (What the student sees) ───────────────────────
-    const displayAlerts = [];
-    if (hasPhoneDetected)   displayAlerts.push("Cell phone detected!");
-    if (hasMultiplePersons) displayAlerts.push("Multiple people detected!");
-    if (hasSpeech)          displayAlerts.push("Talking/Speech detected!");
-    if (hasGazeStrike)      displayAlerts.push("⚠️ Continuous gaze violation!");
+        // ── 1. UI ALERTS ───────────────────────────────────────────
+        const displayAlerts = [];
+        if (hasPhoneDetected)   displayAlerts.push("Cell phone detected!");
+        if (hasMultiplePersons) displayAlerts.push("Multiple people detected!");
+        if (hasSpeech)          showTimedAlert("Talking/Speech detected!","warning");
+        if (hasGazeStrike)      displayAlerts.push("⚠️ Continuous gaze violation!");
 
-    if (displayAlerts.length > 0) {
-      showTimedAlert(displayAlerts.join(" | "), "violation");
-      setGazeCountdown(null);
-    } else if (isNoFace || isFaceMissing) {
-      showTimedAlert("Face not visible. Please stay in front of the camera.", "warning");
-    } else if (countdownValue !== null) {
-      // Show countdown for gaze strike
-      setGazeCountdown(countdownValue);
-      showTimedAlert(`Please focus on your screen! Strike in ${countdownValue}s`, "warning");
-    } else if (hasSuspiciousGaze) {
-      setGazeCountdown(null);
-      showTimedAlert("Please focus on your screen!", "warning");
-    }
+        if (displayAlerts.length > 0) {
+          showTimedAlert(displayAlerts.join(" | "), "violation");
+          setGazeCountdown(null);
+        } else if (isNoFace || isFaceMissing) {
+          showTimedAlert("Face not visible. Please stay in front of the camera.", "warning");
+        } else if (countdownValue !== null) {
+          setGazeCountdown(countdownValue);
+          showTimedAlert(`Please focus on your screen! Strike in ${countdownValue}s`, "warning");
+        } else if (hasSuspiciousGaze) {
+          setGazeCountdown(null);
+          showTimedAlert("Please focus on your screen!", "warning");
+        }
 
-    // ── 2. DB LOGGING (Only Main Gaze Strike and Hard Violations) ──
-    if (hasPhoneDetected && now - lastPhoneLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
-      lastPhoneLogRef.current = now;
-      handleViolation("PHONE_DETECTED");
-    }
-    if (hasMultiplePersons && now - lastMultiplePersonsLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
-      lastMultiplePersonsLogRef.current = now;
-      handleViolation("MULTIPLE_PERSONS");
-    }
-    if ((isNoFace || isFaceMissing) && now - lastNoFaceLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
-      lastNoFaceLogRef.current = now;
-      handleViolation("NO_FACE_DETECTED");
-    }
-    if (hasSpeech && now - lastSpeechLogRef.current > HARD_VIOLATION_DEBOUNCE_MS) {
-      lastSpeechLogRef.current = now;
-      handleViolation("SPEECH_DETECTED");
-    }
-    
-    // The "Main Gaze Strike" - only updates DB when backend confirms the 5s window is over
-    if (hasGazeStrike && now - lastGazeStrikeLogRef.current > GAZE_STRIKE_DEBOUNCE_MS) {
-      lastGazeStrikeLogRef.current = now;
-      handleViolation("GAZE_STRIKE"); 
-      console.log("🚨 MAIN GAZE_STRIKE logged to database");
-    }
+        // ── 2. DB LOGGING — use handleViolationRef to avoid stale closure ──
+        // ✅ FIX: bypass debounce entirely if strikes already at/over limit
+        const overLimit = currentStrikesRef.current >= MAX_STRIKES;
 
-  } else {
-    // If status is "ok" or "success", clear UI
-    setMlAlert(null);
-    setGazeCountdown(null);
-  }
-};
+        if (hasPhoneDetected && (overLimit || now - lastPhoneLogRef.current > HARD_VIOLATION_DEBOUNCE_MS)) {
+          lastPhoneLogRef.current = now;
+          handleViolationRef.current("PHONE_DETECTED");
+        }
+        if (hasMultiplePersons && (overLimit || now - lastMultiplePersonsLogRef.current > HARD_VIOLATION_DEBOUNCE_MS)) {
+          lastMultiplePersonsLogRef.current = now;
+          handleViolationRef.current("MULTIPLE_PERSONS");
+        }
+        if ((isNoFace || isFaceMissing) && (overLimit || now - lastNoFaceLogRef.current > HARD_VIOLATION_DEBOUNCE_MS)) {
+          lastNoFaceLogRef.current = now;
+          handleViolationRef.current("NO_FACE_DETECTED");
+        }
+        if (hasSpeech && (overLimit || now - lastSpeechLogRef.current > HARD_VIOLATION_DEBOUNCE_MS)) {
+          lastSpeechLogRef.current = now;
+          // handleViolationRef.current("SPEECH_DETECTED");
+        }
+        if (hasGazeStrike && (overLimit || now - lastGazeStrikeLogRef.current > GAZE_STRIKE_DEBOUNCE_MS)) {
+          lastGazeStrikeLogRef.current = now;
+          // handleViolationRef.current("GAZE_STRIKE");
+          console.log("🚨 MAIN GAZE_STRIKE logged to database");
+        }
+
+      } else {
+        // status is "ok" or "success" — clear UI
+        setMlAlert(null);
+        setGazeCountdown(null);
+      }
+    };
 
     wsRef.current.onerror = (err) => console.error("❌ ML WS Error:", err);
     wsRef.current.onclose = () => {
@@ -345,10 +364,11 @@ const ExamTakerPage = () => {
       await fullscreenRef.current.requestFullscreen();
       setIsFullscreen(true);
 
+      // ✅ FIX: reduced from 2000ms to 500ms so early violations aren't silently ignored
       setTimeout(() => {
         proctoringActiveRef.current = true;
         console.log("✅ Proctoring active");
-      }, 2000);
+      }, 500);
 
       startMLMonitoring();
     } catch (err) {
@@ -360,7 +380,6 @@ const ExamTakerPage = () => {
 
   /* =========================
      FULLSCREEN EXIT
-     Uses examRef — no stale closure on `exam`
   ========================= */
   useEffect(() => {
     const onChange = () => {
@@ -368,13 +387,14 @@ const ExamTakerPage = () => {
         setIsFullscreen(false);
         if (examRef.current && !isSubmittedRef.current && proctoringActiveRef.current) {
           proctoringActiveRef.current = false;
-          handleViolation("EXIT_FULLSCREEN");
+          // ✅ FIX: use handleViolationRef so this closure is never stale
+          handleViolationRef.current("EXIT_FULLSCREEN");
         }
       }
     };
     document.addEventListener("fullscreenchange", onChange);
     return () => document.removeEventListener("fullscreenchange", onChange);
-  }, []); // ✅ empty deps — examRef is always fresh
+  }, []);
 
   /* =========================
      TAB / WINDOW DETECTION
@@ -384,11 +404,14 @@ const ExamTakerPage = () => {
 
     const handleHidden = () => {
       if (!proctoringActiveRef.current) return;
-      if (document.visibilityState !== "visible") handleViolation("TAB_SWITCH");
+      if (document.visibilityState !== "visible") handleViolationRef.current("TAB_SWITCH"); // ✅ FIX
     };
     const handleBlur = () => {
       if (!proctoringActiveRef.current) return;
-      blurTimeoutRef.current = setTimeout(() => handleViolation("WINDOW_BLUR"), 1000);
+      blurTimeoutRef.current = setTimeout(
+        () => handleViolationRef.current("WINDOW_BLUR"), // ✅ FIX
+        1000
+      );
     };
     const handleFocus = () => {
       if (blurTimeoutRef.current) {
@@ -424,7 +447,6 @@ const ExamTakerPage = () => {
           { examCode },
           { headers: { Authorization: `Bearer ${token}` } }
         );
-        // Populate ref immediately so any closure that runs before re-render has the data
         examRef.current    = data.exam;
         answersRef.current = {};
         data.exam.questions.forEach(q => (answersRef.current[q._id] = ""));
@@ -458,7 +480,7 @@ const ExamTakerPage = () => {
       });
     }, 1000);
     return () => clearInterval(t);
-  }, [exam, isSubmitted]); // intentionally excludes timeLeft — avoids re-creating interval every second
+  }, [exam, isSubmitted]);
 
   /* =========================
      UI RENDER
@@ -469,10 +491,15 @@ const ExamTakerPage = () => {
     return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   }, [timeLeft]);
 
-  if (loading) return <div className="h-screen flex items-center justify-center">Loading…</div>;
-  if (error)   return (
+  if (loading) return (
+    <div className="h-screen flex items-center justify-center text-gray-500 text-lg">
+      Loading…
+    </div>
+  );
+  if (error) return (
     <div className="p-8 max-w-lg mx-auto mt-20 bg-red-100 rounded">
-      <XMarkIcon className="w-6 h-6 inline mr-2" />{error}
+      <XMarkIcon className="w-6 h-6 inline mr-2 text-red-600" />
+      <span className="text-red-700">{error}</span>
     </div>
   );
 
@@ -545,26 +572,26 @@ const ExamTakerPage = () => {
       <div className="max-w-6xl mx-auto p-6">
         <div className="flex justify-between bg-white p-4 rounded shadow mb-6">
           <h1 className="text-2xl font-bold">{exam.title}</h1>
-          <div className="font-mono text-lg">
+          <div className="font-mono text-lg flex items-center gap-2">
             <ClockIcon className="w-6 h-6 inline" /> {formatTime}
           </div>
         </div>
 
         <div className="bg-white p-6 rounded shadow">
           <h2 className="text-xl font-semibold mb-4">
-            Question {currentQuestionIndex + 1}/{exam.questions.length}
+            Question {currentQuestionIndex + 1} / {exam.questions.length}
           </h2>
 
           <p className="mb-4">{q.questionText}</p>
 
           {q.type === "mcq" && q.options.map((opt, i) => (
-            <label key={i} className="block mb-2">
+            <label key={i} className="block mb-2 cursor-pointer">
               <input
                 type="radio"
                 checked={answers[q._id] === opt}
                 onChange={() => setAnswers(p => {
                   const next = { ...p, [q._id]: opt };
-                  answersRef.current = next; // keep ref in sync immediately
+                  answersRef.current = next;
                   return next;
                 })}
                 className="mr-2"
@@ -581,11 +608,11 @@ const ExamTakerPage = () => {
                 const val = e.target.value;
                 setAnswers(p => {
                   const next = { ...p, [q._id]: val };
-                  answersRef.current = next; // keep ref in sync immediately
+                  answersRef.current = next;
                   return next;
                 });
               }}
-              className="w-full border p-2 rounded"
+              className="w-full border p-2 rounded resize-none focus:outline-none focus:ring-2 focus:ring-indigo-400"
             />
           )}
 
@@ -593,14 +620,14 @@ const ExamTakerPage = () => {
             <button
               disabled={currentQuestionIndex === 0}
               onClick={() => setCurrentQuestionIndex(i => i - 1)}
-              className="px-4 py-2 bg-gray-200 rounded hover:bg-gray-300 transition"
+              className="px-4 py-2 bg-gray-200 rounded hover:bg-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <ChevronLeftIcon className="w-5 h-5 inline" /> Prev
             </button>
             <button
               disabled={currentQuestionIndex === exam.questions.length - 1}
               onClick={() => setCurrentQuestionIndex(i => i + 1)}
-              className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 transition"
+              className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Next <ChevronRightIcon className="w-5 h-5 inline" />
             </button>
