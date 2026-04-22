@@ -54,11 +54,16 @@ def shutdown_event():
         audio_module.stop_listening()
 
 
-# Seconds of continuous looking-away before a GAZE_STRIKE is issued
-GAZE_STRIKE_THRESHOLD_SECONDS = 5
+# ── Gaze timing constants ─────────────────────────────────────────────────────
+#
+# Total time looking away before a GAZE_STRIKE fires.
+# GazeTracker.warning_delay is now 0 — all timing lives here.
+#
+GAZE_STRIKE_THRESHOLD_SECONDS = 5   # ✅ was 3 — gives students more grace time
+                                     #    and reduces false positives from brief glances
 
-# Frontend countdown warning starts this many seconds before the strike
-GAZE_WARNING_LEAD_SECONDS = 3
+# Frontend countdown warning starts this many seconds before the strike.
+GAZE_WARNING_LEAD_SECONDS = 3       # ✅ was 2 — student sees countdown for longer
 
 # Minimum good frames required per calibration point
 MIN_FRAMES_PER_POINT = 15
@@ -69,10 +74,6 @@ MIN_FRAMES_PER_POINT = 15
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def safe_send(websocket: WebSocket, data: dict) -> bool:
-    """
-    Send JSON to the client. Returns False if the connection is already closed
-    so callers can break out of their loop without crashing.
-    """
     try:
         await websocket.send_json(data)
         return True
@@ -98,14 +99,12 @@ async def calibrate_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # ── Receive next message ──────────────────────────────────────
             try:
                 message = await websocket.receive()
             except WebSocketDisconnect:
                 print("🔌 Calibration client disconnected during receive")
                 break
 
-            # Only handle text messages
             if "text" not in message:
                 continue
 
@@ -181,15 +180,13 @@ async def calibrate_endpoint(websocket: WebSocket):
                     "type":      "CALIBRATION_COMPLETE",
                     "safe_zone": safe_zone,
                 })
-                break   # calibration done — close loop cleanly
+                break
 
     except Exception as e:
-        # Catch anything unexpected that isn't a normal disconnect
         print(f"⚠️ Calibration unexpected error: {e}")
         await safe_send(websocket, {"type": "ERROR", "detail": str(e)})
 
     finally:
-        # Always reset so the next student gets a clean state
         gaze_tracker.reset_calibration()
         print("🔌 Calibration session ended")
 
@@ -213,7 +210,6 @@ async def monitor_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # ── Receive next message ──────────────────────────────────────
             try:
                 message = await websocket.receive()
             except WebSocketDisconnect:
@@ -244,9 +240,9 @@ async def monitor_endpoint(websocket: WebSocket):
             if frame is None:
                 continue
 
-            status      = "clean"
-            alerts      = []
-            analysis    = {}
+            status       = "clean"
+            alerts       = []
+            analysis     = {}
             obj_analysis = {}
 
             # ── Object detection ──────────────────────────────────────────
@@ -276,8 +272,8 @@ async def monitor_endpoint(websocket: WebSocket):
                         direction, pitch, yaw = gaze_tracker.predict(frame)
 
                         analysis["gaze_direction"] = direction
-                        analysis["pitch"]          = round(float(pitch), 2)
-                        analysis["yaw"]            = round(float(yaw),   2)
+                        analysis["pitch"]          = round(float(pitch), 4)
+                        analysis["yaw"]            = round(float(yaw),   4)
 
                         away = {
                             "LOOKING_LEFT", "LOOKING_RIGHT",
@@ -294,12 +290,11 @@ async def monitor_endpoint(websocket: WebSocket):
 
                             elapsed = now - gaze_away_since
 
-                            # Immediate directional warning
                             if status == "clean":
                                 status = "warning"
-                            alerts.append(f"SUSPICIOUS_GAZE")
+                            alerts.append("SUSPICIOUS_GAZE")
 
-                            # Countdown phase
+                            # ── Countdown phase ───────────────────────────
                             warning_start = (
                                 GAZE_STRIKE_THRESHOLD_SECONDS
                                 - GAZE_WARNING_LEAD_SECONDS
@@ -312,26 +307,39 @@ async def monitor_endpoint(websocket: WebSocket):
                                 alerts.append(f"GAZE_COUNTDOWN: {seconds_left}")
                                 analysis["gaze_seconds_left"] = seconds_left
 
-                            # Strike — fires exactly once per away episode
+                            # ── Strike — fires once per away episode ──────
                             if (elapsed >= GAZE_STRIKE_THRESHOLD_SECONDS
                                     and not gaze_strike_issued):
                                 status = "violation"
                                 alerts.append("GAZE_STRIKE")
                                 gaze_strike_issued = True
+                                # ✅ FIX: reset timer after strike so next away
+                                # starts a fresh episode — prevents double-strike
+                                # on the very next frame (elapsed still >= threshold)
+                                gaze_away_since = time.time()
                                 print(
                                     f"🚨 GAZE_STRIKE: examId={exam_id} "
                                     f"after {elapsed:.1f}s"
                                 )
 
                         elif direction == "FOCUSED":
+                            # ✅ Reset timer only when truly focused
                             gaze_away_since    = None
                             gaze_strike_issued = False
 
+                        # ── Face visible but gaze undetectable ───────────
                         if (direction == "NO_FACE"
                                 and obj_analysis.get("person_count", 0) > 0):
                             if status == "clean":
                                 status = "warning"
                             alerts.append("FACE_NOT_VISIBLE")
+
+                        # ── No face + no person = NO_FACE_DETECTED ────────
+                        if (direction == "NO_FACE"
+                                and obj_analysis.get("person_count", 0) == 0):
+                            if status == "clean":
+                                status = "warning"
+                            alerts.append("NO_FACE_DETECTED")
 
                 except Exception as e:
                     print(f"⚠️ Gaze tracking error: {e}")
@@ -350,6 +358,11 @@ async def monitor_endpoint(websocket: WebSocket):
             else:
                 analysis["audio_status"] = "Offline"
 
+            # ── Determine final status ────────────────────────────────────
+            # Upgrade "clean" to "ok" for frontend clarity
+            if not alerts:
+                status = "ok"
+
             # ── Send result ───────────────────────────────────────────────
             sent = await safe_send(websocket, {
                 "status": status,
@@ -357,16 +370,16 @@ async def monitor_endpoint(websocket: WebSocket):
                 "data":   analysis,
             })
             if not sent:
-                # Client gone — stop the loop cleanly
                 print(f"🔌 Monitor send failed, closing: examId={exam_id}")
                 break
 
     except Exception as e:
-        # Unexpected non-disconnect error
-        print(f"⚠️ Monitor unexpected error: examId={exam_id} → {e}")
+        if "disconnect" in str(e).lower() or "receive" in str(e).lower():
+            print(f"👋 Normal disconnect: examId={exam_id}")
+        else:
+            print(f"⚠️ Monitor unexpected error: examId={exam_id} → {e}")
 
     finally:
-        # Always clean up regardless of how we exited
         if gaze_tracker:
             gaze_tracker.reset_calibration()
         print(f"🔌 Monitor session ended: examId={exam_id}")

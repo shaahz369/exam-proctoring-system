@@ -310,7 +310,7 @@ const ExamTakerPage = () => {
         }
         if (hasGazeStrike && (overLimit || now - lastGazeStrikeLogRef.current > GAZE_STRIKE_DEBOUNCE_MS)) {
           lastGazeStrikeLogRef.current = now;
-          // handleViolationRef.current("GAZE_STRIKE");
+          handleViolationRef.current("GAZE_STRIKE");
           console.log("🚨 MAIN GAZE_STRIKE logged to database");
         }
 

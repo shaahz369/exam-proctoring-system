@@ -237,7 +237,7 @@ const ExamResultsPage = () => {
                     : "text-green-600"
                 }`}
               >
-                {proctorLogs.length}/{MAX_STRIKES}
+                {proctorLogs.length}
               </span>
             </p>
 
