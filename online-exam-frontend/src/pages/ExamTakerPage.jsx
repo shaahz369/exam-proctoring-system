@@ -20,7 +20,7 @@ const MAX_STRIKES  = 3;
 const HARD_VIOLATION_DEBOUNCE_MS = 10000; // 10 s
 const GAZE_STRIKE_DEBOUNCE_MS    = 5000;  //  5 s
 
-const ExamTakerPage = () => {
+const akerPage = () => {
   const navigate = useNavigate();
   const location = useLocation();
 

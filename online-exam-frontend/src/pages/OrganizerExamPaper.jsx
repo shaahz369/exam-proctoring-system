@@ -78,7 +78,7 @@ const OrganizerExamPaper = () => {
      RENDER
   ========================= */
   return (
-    <div className="min-h-screen bg-gray-50 p-8">
+    <div className="h-screen overflow-y-auto bg-gray-50 p-8">
       <div className="max-w-5xl mx-auto space-y-6">
 
         {/* Header */}
