@@ -17,14 +17,18 @@ Scalable full-stack exam proctoring platform utilizing React, Node.js, and deep 
 ### Backend
 cd exam-proctoring-backend
 npm install
-npm start
+npm run dev
+
+### ML Service
+cd ml-service
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
 
 ### Frontend
 cd online-exam-frontend
 npm install
-npm start
+npm run dev
 
-### ML Service
-cd ml-service
-pip install -r requirements.txt
-python app.py
+
